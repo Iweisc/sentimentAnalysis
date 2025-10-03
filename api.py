@@ -4,254 +4,223 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import re
 import time
 import sys
-from typing import List, Tuple
-from dataclasses import dataclass
+from typing import List, Tuple, AsyncGenerator, Dict, Any, Union
 import io
 import logging
+import uuid
+import asyncio
+from asyncio import Queue
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 import uvicorn
+from pydantic import BaseModel, Field
 
-from transformers import pipeline
+from profanity_check import predict as profanity_predict
 
 from pdf2image import convert_from_bytes
 import pytesseract
-from PIL import Image, ImageDraw
-
+from PIL import Image
 import cv2
 import numpy as np
 from thefuzz import fuzz
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log = logging.getLogger(__name__)
 
-@dataclass
-class CensorResult:
-    original_text: str
-    censored_text: str
-    detected_words: List[str]
-    confidence_scores: List[float]
-    processing_time_ms: float
+class ProfanityRedactionResponseSchema(BaseModel):
+    original_content: str = Field(..., alias='original_text')
+    redacted_content: str = Field(..., alias='censored_text')
+    identified_profanities: List[str] = Field(..., alias='detected_words')
+    execution_duration_ms: float = Field(..., alias='processing_time_ms')
 
-UNAMBIGUOUS_PROFANITIES = {
-    "fuck", "shit", "piss", "bitch", "cunt", "asshole", "bastard", "dick",
-    "douche", "goddamn", "hell", "motherfucker", "nigger", "pussy", "slut",
-    "son of a bitch", "tits", "whore", "faggot", "damn", "crap", "bloody", "bugger", "prick", "balls"
-}
-
-class Censor:
-    def __init__(self):
-        self.model_loaded = False
-        self.text_classifier = None
-        self._load_models()
-
-    def _load_models(self):
-        try:
-            model_name = "martin-ha/toxic-comment-model"
-            logging.info(f"Loading model: {model_name}. This might take a moment...")
-            
-            self.text_classifier = pipeline(
-                "text-classification",
-                model=model_name,
-                device=-1,
-                top_k=None
-            )
-            
-            self.model_loaded = True
-            logging.info("Model loaded. Ready to censor!")
-
-        except Exception as e:
-            logging.error(f"Couldn't load the transformers model. Aborting. Error: {e}")
-            sys.exit(1)
-
-    def _get_overall_toxicity(self, text: str) -> float:
-        if not text.strip(): 
-            return 0.0
-        try:
-            results = self.text_classifier(text[:512]) 
-            max_score = 0.0
-            RELEVANT_LABELS = {'toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate'}
-            if isinstance(results, list) and len(results) > 0 and isinstance(results[0], list):
-                for item in results[0]:
-                    if item['label'].lower() in RELEVANT_LABELS:
-                        max_score = max(max_score, item['score'])
-            return max_score
-        except Exception as e:
-            logging.error(f"Something went wrong during text classification: {e}")
-            return 0.0
-
-    def _find_toxic_words_by_contribution(self, text: str, initial_score: float) -> List[Tuple[str, float, int, int]]:
-        detected = []
-        words_in_text = list(re.finditer(r'\b[\w\']+\b', text))
+    class Config:
+        allow_population_by_field_name = True
         
-        for match in words_in_text:
-            word = match.group()
-            if len(word) <= 2: continue
-            start, end = match.start(), match.end()
-            
-            masked_text = text[:start] + "[MASK]" + text[end:]
-            new_score = self._get_overall_toxicity(masked_text)
-            contribution = initial_score - new_score
-            
-            if contribution > 0.15:
-                detected.append((word, initial_score, start, end))
-        return detected
+class ObfuscationEngine:
+    def process_and_conceal(self, text_input: str) -> Tuple[str, List[str]]:
+        if not text_input or text_input.isspace():
+            return text_input, []
 
-    def _find_unambiguous_profanities(self, text: str) -> List[Tuple[str, float, int, int]]:
-        detected = []
-        words_in_text = list(re.finditer(r'\b[\w\']+\b', text))
-        for match in words_in_text:
-            if match.group().lower() in UNAMBIGUOUS_PROFANITIES:
-                detected.append((match.group(), 1.0, match.start(), match.end()))
-        return detected
+        profanity_localizations = self._identify_profane_substrings(text_input)
 
-    def detect_and_censor(self, text: str, confidence_threshold: float = 0.7, 
-                         censor_method: str = "asterisk") -> CensorResult:
-        start_time = time.perf_counter()
-        
-        if not text.strip():
-            return CensorResult("", "", [], [], 0.0)
-        
-        word_detections = self._find_unambiguous_profanities(text)
-        detected_word_set = {d[0].lower() for d in word_detections}
+        text_buffer = list(text_input)
+        profanity_lexicon = [detection[0] for detection in sorted(profanity_localizations, key=lambda x: x[2])]
 
-        overall_score = self._get_overall_toxicity(text)
-        if overall_score >= confidence_threshold:
-            contextual_detections = self._find_toxic_words_by_contribution(text, overall_score)
-            for detection in contextual_detections:
-                if detection[0].lower() not in detected_word_set:
-                    word_detections.append(detection)
-                    detected_word_set.add(detection[0].lower())
+        for word, start_idx, end_idx in sorted(profanity_localizations, key=lambda x: x[1], reverse=True):
+            obfuscation_character = '*'
+            # Ternary operator for single-character words
+            redacted_fragment = (word[0] + obfuscation_character * (len(word) - 1)) if len(word) > 1 else obfuscation_character
+            text_buffer[start_idx:end_idx] = redacted_fragment
+    
+        return "".join(text_buffer), profanity_lexicon
 
-        detected_words = []
-        confidence_scores = []
-        censored = list(text)
-        
-        for word, score, start, end in sorted(word_detections, key=lambda x: x[2], reverse=True):
-            if word not in detected_words:
-                detected_words.insert(0, word)
-                confidence_scores.insert(0, score)
-                censored_word = self._censor_word(word, censor_method)
-                censored[start:end] = censored_word
-        
-        processing_time = (time.perf_counter() - start_time) * 1000
-        
-        return CensorResult(
-            original_text=text,
-            censored_text="".join(censored),
-            detected_words=detected_words,
-            confidence_scores=confidence_scores,
-            processing_time_ms=processing_time
-        )
+    def _identify_profane_substrings(self, text_input: str) -> List[Tuple[str, int, int]]:
+        return [(match.group(0), match.start(), match.end())
+                for match in re.finditer(r'\b[\w\']+\b', text_input)
+                if profanity_predict([match.group(0)])[0] == 1]
 
-    def _censor_word(self, word: str, method: str) -> str:
-        if method == "asterisk":
-            return word[0] + '*' * (len(word) - 1) if len(word) > 1 else '*'
-        elif method == "full_asterisk":
-            return '*' * len(word)
-        elif method == "grawlix":
-            import random
-            symbols = ['#', '@', '$', '%', '&', '*']
-            return ''.join(random.choice(symbols) for _ in range(len(word)))
-        elif method == "block":
-            return '[CENSORED]'
-        else:
-            return word[0] + '*' * (len(word) - 1) if len(word) > 1 else '*'
+class AsynchronousJobCoordinator:
+    def __init__(self, pool_size=2):
+        self.thread_pool_executor = ThreadPoolExecutor(max_workers=pool_size)
+        self.active_tasks: Dict[str, Dict[str, Any]] = {}
+
+    def dispatch_computation(self, coroutine_callable, *args, **kwargs):
+        task_identifier = str(uuid.uuid4())
+        message_queue = asyncio.Queue()
+        future_obj = self.thread_pool_executor.submit(coroutine_callable, message_queue=message_queue, *args, **kwargs)
+        self.active_tasks[task_identifier] = {"computation_future": future_obj, "communication_channel": message_queue}
+        log.info(f"Dispatched new computation with Task ID: {task_identifier}")
+        return task_identifier
+
+    def retrieve_job_queue(self, task_identifier: str) -> asyncio.Queue:
+        job_metadata = self.active_tasks.get(task_identifier)
+        if not job_metadata:
+            raise KeyError("Invalid Task Identifier")
+        return job_metadata["communication_channel"]
+
+    def release_job_resources(self, task_identifier: str):
+        if task_identifier in self.active_tasks:
+            del self.active_tasks[task_identifier]
+            log.info(f"Deallocated resources for Task ID: {task_identifier}")
 
 app = FastAPI(
     title="Profanity Detection API",
     description="A smart API that uses a hybrid approach to find and censor swear words.",
-    version="4.2.0"
+    version="6.0.0"
 )
 
-detector = Censor()
+obfuscation_engine_instance = ObfuscationEngine()
+async_job_coordinator = AsynchronousJobCoordinator()
 
-@app.on_event("startup")
-async def startup_event():
-    logging.info("API is up and running. Let the censoring begin!")
-
-@app.post("/censor", response_model=CensorResult)
-async def censor_text(
-    text: str = Form(...),
-    confidence_threshold: float = Form(0.7, ge=0.0, le=1.0),
-    censor_method: str = Form("asterisk")
-):
-    """Censors a given block of text."""
-    result = detector.detect_and_censor(
-        text=text,
-        confidence_threshold=confidence_threshold,
-        censor_method=censor_method
-    )
-    return result
-
-@app.post("/censor-pdf")
-async def censor_pdf(
-    file: UploadFile = File(...),
-    confidence_threshold: float = Form(0.7, ge=0.0, le=1.0)
-):
-    """Censors a PDF document by redacting words with black boxes."""
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Hey, that's not a PDF! Please upload a PDF file.")
-
+def pdf_redaction_pipeline(message_queue: Queue, pdf_binary_data: bytes, source_filename: str, image_resolution: int):
     try:
-        pdf_contents = await file.read()
-        original_images = convert_from_bytes(pdf_contents)
-        censored_images = []
-        tesseract_config = r'--oem 3 --psm 6'
+        message_queue.put_nowait({"status": "processing", "stage": "Initializing PDF to image rasterization..."})
+        image_pages = convert_from_bytes(pdf_binary_data, dpi=image_resolution)
+        obfuscated_images = []
+        pytesseract_parameters = r'--oem 3 --psm 6'
 
-        for page_num, image in enumerate(original_images, 1):
-            logging.info(f"Checking out page {page_num}...")
-            
-            open_cv_image = np.array(image)
-            open_cv_image = open_cv_image[:, :, ::-1].copy()
-            gray_image = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
-            _, binary_image = cv.threshold(gray_image, 180, 255, cv2.THRESH_BINARY)
-            processed_pil_image = Image.fromarray(binary_image)
-            
-            full_page_text = pytesseract.image_to_string(processed_pil_image, config=tesseract_config)
-            censor_result = detector.detect_and_censor(full_page_text, confidence_threshold)
-            words_to_censor = {word.lower() for word in censor_result.detected_words}
+        for page_index, page_image_obj in enumerate(image_pages):
+            page_identifier = page_index + 1
+            message_queue.put_nowait({"status": "processing", "stage": f"Analyzing page {page_identifier}/{len(image_pages)}...", "progress": (page_index / len(image_pages)) * 100})
 
-            if words_to_censor:
-                logging.info(f"Found some words to censor on page {page_num}: {words_to_censor}")
-            else:
-                logging.info(f"Page {page_num} looks clean. Moving on.")
-                censored_images.append(image)
+            page_text_content = pytesseract.image_to_string(page_image_obj)
+            _, profanities_to_redact = obfuscation_engine_instance.process_and_conceal(page_text_content)
+            profanities_to_redact_set = {word.lower() for word in profanities_to_redact}
+
+            if not profanities_to_redact_set:
+                obfuscated_images.append(page_image_obj)
                 continue
 
-            image_data = pytesseract.image_to_data(processed_pil_image, output_type=pytesseract.Output.DICT, config=tesseract_config)
-            draw = ImageDraw.Draw(image)
+            ocr_metadata = pytesseract.image_to_data(page_image_obj, output_type=pytesseract.Output.DICT, config=pytesseract_parameters)
             
-            num_boxes = len(image_data['level'])
-            for i in range(num_boxes):
-                ocr_word = image_data['text'][i].strip().lower()
-                if not ocr_word: continue
-                
-                for profane_word in words_to_censor:
-                    if fuzz.ratio(ocr_word, profane_word) > 85:
-                        logging.info(f"Redacting '{ocr_word}' on page {page_num} (it's a lot like '{profane_word}').")
-                        x, y, w, h = image_data['left'][i], image_data['top'][i], image_data['width'][i], image_data['height'][i]
-                        draw.rectangle([x, y, x + w, y + h], fill='black')
-                        break
-            
-            censored_images.append(image)
+            for ocr_idx in range(len(ocr_metadata['text'])):
+                ocr_token = ocr_metadata['text'][ocr_idx].strip().lower()
+                if not ocr_token: continue
 
-        pdf_buffer = io.BytesIO()
-        if censored_images:
-            censored_images[0].save(pdf_buffer, "PDF", resolution=100.0, save_all=True, append_images=censored_images[1:])
-        pdf_buffer.seek(0)
-        
-        headers = {'Content-Disposition': 'attachment; filename="censored_document.pdf"'}
-        return StreamingResponse(pdf_buffer, headers=headers, media_type="application/pdf")
+                if any(fuzz.ratio(ocr_token, profane_word) > 85 for profane_word in profanities_to_redact_set):
+                    x, y, w, h = ocr_metadata['left'][ocr_idx], ocr_metadata['top'][ocr_idx], ocr_metadata['width'][ocr_idx], ocr_metadata['height'][ocr_idx]
+                    if w > 0 and h > 0:
+                        image_region = page_image_obj.crop((x, y, x + w, y + h))
+                        pixelation_factor = max(1, min(w, h) // 4)
+                        downsampled_region = image_region.resize((pixelation_factor, pixelation_factor), resample=Image.Resampling.BILINEAR)
+                        upsampled_region = downsampled_region.resize(image_region.size, Image.Resampling.NEAREST)
+                        page_image_obj.paste(upsampled_region, (x, y))
+            obfuscated_images.append(page_image_obj)
+
+        message_queue.put_nowait({"status": "processing", "stage": "Synthesizing redacted PDF document..."})
+        output_pdf_buffer = io.BytesIO()
+        if obfuscated_images:
+            obfuscated_images[0].save(output_pdf_buffer, "PDF", resolution=image_resolution, save_all=True, append_images=obfuscated_images[1:])
+        output_pdf_buffer.seek(0)
+    
+        message_queue.put_nowait({"type": "pdf", "data": output_pdf_buffer.read(), "filename": f"redacted_{source_filename}"})
 
     except Exception as e:
-        logging.error(f"Oh no, something went wrong with the PDF processing: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to process the PDF. Error: {e}")
+        log.error(f"Catastrophic failure in worker for '{source_filename}': {e}", exc_info=True)
+        message_queue.put_nowait({"status": "error", "detail": f"An unrecoverable internal error occurred: {e}"})
+    finally:
+        message_queue.put_nowait(None) 
 
-@app.get("/")
-async def root():
-    return {"message": "Welcome! Send your text to /censor or a PDF to /censor-pdf."}
+async def multipart_stream_generator(message_queue: Queue, task_identifier: str) -> AsyncGenerator[bytes, None]:
+    stream_boundary = f"boundary-{uuid.uuid4().hex}"
+    http_headers = f'Content-Type: multipart/x-mixed-replace; boundary={stream_boundary}\r\n\r\n'
+    yield http_headers.encode()
+
+    try:
+        while True:
+            queue_item = await message_queue.get()
+            if queue_item is None: break
+            
+            yield f'--{stream_boundary}\r\n'.encode()
+            
+            if "status" in queue_item or "stage" in queue_item:
+                json_payload = str(queue_item).replace("'", '"').encode('utf-8')
+                yield b'Content-Type: application/json\r\n\r\n'
+                yield json_payload
+            elif queue_item.get("type") == "pdf":
+                pdf_payload = queue_item["data"]
+                destination_filename = queue_item["filename"]
+                yield f'Content-Disposition: attachment; filename="{destination_filename}"\r\n'.encode()
+                yield b'Content-Type: application/pdf\r\n\r\n'
+                yield pdf_payload
+
+            yield b'\r\n'
+            message_queue.task_done()
+        
+        yield f'--{stream_boundary}--\r\n'.encode()
+    finally:
+        async_job_coordinator.release_job_resources(task_identifier)
+
+@api_instance.post("/redact-text", response_model=ProfanityRedactionResponseSchema)
+async def redact_text_endpoint(text: str = Form(...)):
+    initial_timestamp = time.perf_counter()
+
+    redacted_text, identified_profanities = obfuscation_engine_instance.process_and_conceal(text)
+
+    final_timestamp = time.perf_counter()
+    execution_duration = (final_timestamp - initial_timestamp) * 1000
+
+    return ProfanityRedactionResponseSchema(
+        original_text=text,
+        censored_text=redacted_text,
+        detected_words=identified_profanities,
+        processing_time_ms=execution_duration
+    )
+
+@api_instance.post("/redact-pdf-stream")
+async def redact_pdf_streaming_endpoint(
+    uploaded_file: UploadFile = File(...),
+    resolution_dpi: int = Form(200, ge=72, le=600)
+):
+    if not uploaded_file.content_type == "application/pdf":
+        raise HTTPException(status_code=415, detail="Unsupported MIME type. Please upload a PDF document.")
+
+    pdf_binary_data = await uploaded_file.read()
+    if not pdf_binary_data:
+        raise HTTPException(status_code=400, detail="The provided PDF file is devoid of content.")
+
+    task_identifier = async_job_coordinator.dispatch_computation(
+        pdf_redaction_pipeline,
+        pdf_binary_data=pdf_binary_data,
+        source_filename=uploaded_file.filename,
+        image_resolution=resolution_dpi
+    )
+
+    job_message_queue = async_job_coordinator.retrieve_job_queue(task_identifier)
+    return StreamingResponse(
+        multipart_stream_generator(job_message_queue, task_identifier),
+        media_type=f'multipart/x-mixed-replace; boundary=boundary-{task_identifier}'
+    )
+
+@api_instance.get("/")
+async def service_root():
+    return {
+        "service_name": "Profanity Detection API",
+        "service_version": "6.0.0",
+        "service_description": "A smart API that uses a hybrid approach to find and censor swear words."
+    }
 
 if __name__ == "__main__":
-    print("Starting up the API server...")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(api_instance, host="0.0.0.0", port=8000)
