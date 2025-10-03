@@ -4,7 +4,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import re
 import time
 import sys
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 from dataclasses import dataclass
 import io
 import logging
@@ -39,7 +39,7 @@ UNAMBIGUOUS_PROFANITIES = {
     "son of a bitch", "tits", "whore", "faggot", "damn", "crap", "bloody", "bugger", "prick", "balls"
 }
 
-class censor:
+class Censor:
     def __init__(self):
         self.model_loaded = False
         self.text_classifier = None
@@ -48,7 +48,7 @@ class censor:
     def _load_models(self):
         try:
             model_name = "martin-ha/toxic-comment-model"
-            logging.info(f"Loading model: {model_name}. This may take a moment...")
+            logging.info(f"Loading model: {model_name}. This might take a moment...")
             
             self.text_classifier = pipeline(
                 "text-classification",
@@ -58,16 +58,17 @@ class censor:
             )
             
             self.model_loaded = True
-            logging.info("RoBERTa-large model loaded successfully.")
+            logging.info("Model loaded. Ready to censor!")
 
         except Exception as e:
-            logging.error(f"Error loading transformers model: {e}")
+            logging.error(f"Couldn't load the transformers model. Aborting. Error: {e}")
             sys.exit(1)
 
     def _get_overall_toxicity(self, text: str) -> float:
-        if not text.strip(): return 0.0
+        if not text.strip(): 
+            return 0.0
         try:
-            results = self.text_classifier(text[:512])
+            results = self.text_classifier(text[:512]) 
             max_score = 0.0
             RELEVANT_LABELS = {'toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate'}
             if isinstance(results, list) and len(results) > 0 and isinstance(results[0], list):
@@ -76,7 +77,7 @@ class censor:
                         max_score = max(max_score, item['score'])
             return max_score
         except Exception as e:
-            logging.error(f"Text classification error: {e}")
+            logging.error(f"Something went wrong during text classification: {e}")
             return 0.0
 
     def _find_toxic_words_by_contribution(self, text: str, initial_score: float) -> List[Tuple[str, float, int, int]]:
@@ -87,9 +88,11 @@ class censor:
             word = match.group()
             if len(word) <= 2: continue
             start, end = match.start(), match.end()
+            
             masked_text = text[:start] + "[MASK]" + text[end:]
             new_score = self._get_overall_toxicity(masked_text)
             contribution = initial_score - new_score
+            
             if contribution > 0.15:
                 detected.append((word, initial_score, start, end))
         return detected
@@ -122,20 +125,20 @@ class censor:
 
         detected_words = []
         confidence_scores = []
-        censored = text
+        censored = list(text)
         
-        for word, score, start, end in reversed(sorted(word_detections, key=lambda x: x[2])):
+        for word, score, start, end in sorted(word_detections, key=lambda x: x[2], reverse=True):
             if word not in detected_words:
                 detected_words.insert(0, word)
                 confidence_scores.insert(0, score)
                 censored_word = self._censor_word(word, censor_method)
-                censored = censored[:start] + censored_word + censored[end:]
+                censored[start:end] = censored_word
         
         processing_time = (time.perf_counter() - start_time) * 1000
         
         return CensorResult(
             original_text=text,
-            censored_text=censored,
+            censored_text="".join(censored),
             detected_words=detected_words,
             confidence_scores=confidence_scores,
             processing_time_ms=processing_time
@@ -153,26 +156,27 @@ class censor:
         elif method == "block":
             return '[CENSORED]'
         else:
-            return word
+            return word[0] + '*' * (len(word) - 1) if len(word) > 1 else '*'
 
 app = FastAPI(
     title="Profanity Detection API",
-    description="A high-accuracy FastAPI wrapper for censorship using a hybrid RoBERTa-large and wordlist approach.",
-    version="4.2.0 (Debug)"
+    description="A smart API that uses a hybrid approach to find and censor swear words.",
+    version="4.2.0"
 )
 
-detector = censor()
+detector = Censor()
 
 @app.on_event("startup")
 async def startup_event():
-    logging.info("App started successfully.")
+    logging.info("API is up and running. Let the censoring begin!")
 
 @app.post("/censor", response_model=CensorResult)
 async def censor_text(
     text: str = Form(...),
-    confidence_threshold: float = Form(0.7),
+    confidence_threshold: float = Form(0.7, ge=0.0, le=1.0),
     censor_method: str = Form("asterisk")
 ):
+    """Censors a given block of text."""
     result = detector.detect_and_censor(
         text=text,
         confidence_threshold=confidence_threshold,
@@ -183,10 +187,11 @@ async def censor_text(
 @app.post("/censor-pdf")
 async def censor_pdf(
     file: UploadFile = File(...),
-    confidence_threshold: float = Form(0.7)
+    confidence_threshold: float = Form(0.7, ge=0.0, le=1.0)
 ):
+    """Censors a PDF document by redacting words with black boxes."""
     if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
+        raise HTTPException(status_code=400, detail="Hey, that's not a PDF! Please upload a PDF file.")
 
     try:
         pdf_contents = await file.read()
@@ -195,30 +200,26 @@ async def censor_pdf(
         tesseract_config = r'--oem 3 --psm 6'
 
         for page_num, image in enumerate(original_images, 1):
-            logging.info(f"Processing Page: {page_num}")
+            logging.info(f"Checking out page {page_num}...")
             
             open_cv_image = np.array(image)
             open_cv_image = open_cv_image[:, :, ::-1].copy()
             gray_image = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
-            _, binary_image = cv2.threshold(gray_image, 180, 255, cv2.THRESH_BINARY)
+            _, binary_image = cv.threshold(gray_image, 180, 255, cv2.THRESH_BINARY)
             processed_pil_image = Image.fromarray(binary_image)
             
             full_page_text = pytesseract.image_to_string(processed_pil_image, config=tesseract_config)
             censor_result = detector.detect_and_censor(full_page_text, confidence_threshold)
-            words_to_censor_from_ai = {word.lower() for word in censor_result.detected_words}
+            words_to_censor = {word.lower() for word in censor_result.detected_words}
 
-            logging.info(f"[Page {page_num}] Words detected for censorship by Hybrid model: {words_to_censor_from_ai if words_to_censor_from_ai else 'None'}")
-            
-            image_data = pytesseract.image_to_data(processed_pil_image, output_type=pytesseract.Output.DICT, config=tesseract_config)
-            
-            # *** NEW LOGGING FOR DEBUGGING ***
-            ocr_detected_words = [word for word in image_data['text'] if word.strip()]
-            logging.info(f"[Page {page_num}] All words detected by OCR: {ocr_detected_words}")
-
-            if not words_to_censor_from_ai:
+            if words_to_censor:
+                logging.info(f"Found some words to censor on page {page_num}: {words_to_censor}")
+            else:
+                logging.info(f"Page {page_num} looks clean. Moving on.")
                 censored_images.append(image)
                 continue
 
+            image_data = pytesseract.image_to_data(processed_pil_image, output_type=pytesseract.Output.DICT, config=tesseract_config)
             draw = ImageDraw.Draw(image)
             
             num_boxes = len(image_data['level'])
@@ -226,9 +227,9 @@ async def censor_pdf(
                 ocr_word = image_data['text'][i].strip().lower()
                 if not ocr_word: continue
                 
-                for profane_word in words_to_censor_from_ai:
+                for profane_word in words_to_censor:
                     if fuzz.ratio(ocr_word, profane_word) > 85:
-                        logging.info(f"[Page {page_num}] Redacting OCR word '{ocr_word}' (matched with detected word '{profane_word}')")
+                        logging.info(f"Redacting '{ocr_word}' on page {page_num} (it's a lot like '{profane_word}').")
                         x, y, w, h = image_data['left'][i], image_data['top'][i], image_data['width'][i], image_data['height'][i]
                         draw.rectangle([x, y, x + w, y + h], fill='black')
                         break
@@ -239,16 +240,18 @@ async def censor_pdf(
         if censored_images:
             censored_images[0].save(pdf_buffer, "PDF", resolution=100.0, save_all=True, append_images=censored_images[1:])
         pdf_buffer.seek(0)
+        
         headers = {'Content-Disposition': 'attachment; filename="censored_document.pdf"'}
         return StreamingResponse(pdf_buffer, headers=headers, media_type="application/pdf")
+
     except Exception as e:
-        logging.error(f"An error occurred during PDF processing: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing PDF file: {e}")
+        logging.error(f"Oh no, something went wrong with the PDF processing: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to process the PDF. Error: {e}")
 
 @app.get("/")
 async def root():
-    return {"message": "Send POST requests to /censor with text or to /censor-pdf with a PDF file."}
+    return {"message": "Welcome! Send your text to /censor or a PDF to /censor-pdf."}
 
 if __name__ == "__main__":
-    print("Starting API server...")
-    uvicorn.run("api:app", host="0.custom.0.0", port=8000, reload=True)
+    print("Starting up the API server...")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
