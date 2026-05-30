@@ -37,8 +37,8 @@
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/profanity-api.git
-    cd profanity-api
+    git clone https://github.com/Iweisc/sentimentAnalysis.git
+    cd sentimentAnalysis
     ```
 
 2.  **Create a virtual environment (recommended):**
